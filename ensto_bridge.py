@@ -38,6 +38,7 @@ SERVICE_SETTLE_DELAY = 1.0
 POST_HANDSHAKE_DELAY = 0.1
 READ_RETRY_COUNT = 2
 READ_RETRY_DELAY = 0.75
+NOTIFICATION_WAIT_TIMEOUT = 3.0
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -212,7 +213,9 @@ class EnstoBridge:
                     last_error = None
                     for read_attempt in range(1, READ_RETRY_COUNT + 1):
                         try:
-                            data = await client.read_gatt_char(REAL_TIME_INDICATION_UUID)
+                            # Prefer notify-based read first: this avoids immediate
+                            # read-after-write timing issues seen with some devices.
+                            data = await self.read_real_time_via_notify(client)
                             parsed_data = self.parse_real_time_data(data)
                             logger.info(f"✅ Data read success: {parsed_data}")
                             self.publish_data(device_address, parsed_data)
@@ -245,6 +248,29 @@ class EnstoBridge:
                     f"Retrying in {retry_delay_seconds(attempt)}s..."
                 )
                 await asyncio.sleep(retry_delay_seconds(attempt))
+
+    async def read_real_time_via_notify(self, client):
+        loop = asyncio.get_running_loop()
+        payload_future = loop.create_future()
+
+        def notification_handler(_, data):
+            if not payload_future.done():
+                payload_future.set_result(bytes(data))
+
+        try:
+            await client.start_notify(REAL_TIME_INDICATION_UUID, notification_handler)
+            return await asyncio.wait_for(payload_future, timeout=NOTIFICATION_WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"No notification received in {NOTIFICATION_WAIT_TIMEOUT}s, "
+                "falling back to direct GATT read"
+            )
+            return await client.read_gatt_char(REAL_TIME_INDICATION_UUID)
+        finally:
+            try:
+                await client.stop_notify(REAL_TIME_INDICATION_UUID)
+            except Exception as e:
+                logger.debug(f"stop_notify cleanup failed: {e}")
 
     def parse_real_time_data(self, data):
         if len(data) < 10:
