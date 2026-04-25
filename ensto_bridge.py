@@ -44,6 +44,15 @@ logger = logging.getLogger(__name__)
 logging.getLogger("bleak").setLevel(logging.DEBUG)
 
 
+def is_connection_lost_error(error):
+    message = str(error).lower()
+    return (
+        "service discovery has not been performed yet" in message
+        or "device disconnected" in message
+        or "not connected" in message
+    )
+
+
 class EnstoBridge:
     def __init__(self):
         # Generate a unique client ID to avoid conflicts
@@ -200,6 +209,14 @@ class EnstoBridge:
                             logger.warning(
                                 f"Read failed (attempt {read_attempt}/{READ_RETRY_COUNT}): {e}"
                             )
+
+                            # If the connection is already gone, retrying read on this same
+                            # client always fails. Escalate to outer reconnect retry instead.
+                            if not client.is_connected or is_connection_lost_error(e):
+                                raise RuntimeError(
+                                    f"Connection dropped during read phase: {e}"
+                                ) from e
+
                             if read_attempt < READ_RETRY_COUNT:
                                 await asyncio.sleep(READ_RETRY_DELAY)
 
