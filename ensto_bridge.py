@@ -55,6 +55,14 @@ def is_connection_lost_error(error):
     )
 
 
+def is_notify_not_supported_error(error):
+    message = str(error).lower()
+    return (
+        "not supported" in message
+        or "org.bluez.error.notsupported" in message
+    )
+
+
 def retry_delay_seconds(attempt):
     # Increasing delay helps BlueZ and the thermostat recover from repeated
     # short-lived connection attempts.
@@ -80,6 +88,7 @@ class EnstoBridge:
         
         self.mqtt_client.on_connect = self.on_mqtt_connect
         self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
+        self.notifications_supported = True
 
     def on_mqtt_connect(self, client, userdata, flags, rc, properties=None):
         if rc == 0:
@@ -273,8 +282,12 @@ class EnstoBridge:
                 await asyncio.sleep(retry_delay_seconds(attempt))
 
     async def read_real_time_via_notify(self, client):
+        if not self.notifications_supported:
+            return await client.read_gatt_char(REAL_TIME_INDICATION_UUID)
+
         loop = asyncio.get_running_loop()
         payload_future = loop.create_future()
+        notify_started = False
 
         def notification_handler(_, data):
             if not payload_future.done():
@@ -282,6 +295,7 @@ class EnstoBridge:
 
         try:
             await client.start_notify(REAL_TIME_INDICATION_UUID, notification_handler)
+            notify_started = True
             return await asyncio.wait_for(payload_future, timeout=NOTIFICATION_WAIT_TIMEOUT)
         except asyncio.TimeoutError:
             logger.warning(
@@ -289,11 +303,21 @@ class EnstoBridge:
                 "falling back to direct GATT read"
             )
             return await client.read_gatt_char(REAL_TIME_INDICATION_UUID)
+        except Exception as e:
+            if is_notify_not_supported_error(e):
+                self.notifications_supported = False
+                logger.warning(
+                    "Notifications are not supported for realtime characteristic; "
+                    "switching to direct read mode"
+                )
+                return await client.read_gatt_char(REAL_TIME_INDICATION_UUID)
+            raise
         finally:
-            try:
-                await client.stop_notify(REAL_TIME_INDICATION_UUID)
-            except Exception as e:
-                logger.debug(f"stop_notify cleanup failed: {e}")
+            if notify_started:
+                try:
+                    await client.stop_notify(REAL_TIME_INDICATION_UUID)
+                except Exception as e:
+                    logger.debug(f"stop_notify cleanup failed: {e}")
 
     def parse_real_time_data(self, data):
         if len(data) < 10:
