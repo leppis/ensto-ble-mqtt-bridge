@@ -34,7 +34,8 @@ REAL_TIME_INDICATION_UUID = "66ad3e6b-3135-4ada-bb2b-8b22916b21d4"
 STORAGE_FILE = "ensto_devices.json"
 MAX_DEVICE_ATTEMPTS = 3
 DEVICE_RETRY_DELAY = 2
-POST_HANDSHAKE_DELAY = 0.5
+SERVICE_SETTLE_DELAY = 1.0
+POST_HANDSHAKE_DELAY = 0.1
 READ_RETRY_COUNT = 2
 READ_RETRY_DELAY = 0.75
 
@@ -148,9 +149,12 @@ class EnstoBridge:
 
                     logger.info("Connected successfully")
 
-                    # Initial wait for BlueZ/CoreBluetooth to settle.
-                    logger.info("Waiting for services to initialize...")
-                    await asyncio.sleep(5)
+                    # Keep the settle pause short; long idle waits can cause
+                    # some thermostats to drop the link before handshake.
+                    logger.info("Waiting briefly for services to initialize...")
+                    await asyncio.sleep(SERVICE_SETTLE_DELAY)
+                    if not client.is_connected:
+                        raise RuntimeError("Device disconnected before handshake")
 
                     # Handshake - required on Linux/Raspberry Pi
                     logger.info("Attempting handshake...")
@@ -193,6 +197,8 @@ class EnstoBridge:
                         return
 
                     await asyncio.sleep(POST_HANDSHAKE_DELAY)
+                    if not client.is_connected:
+                        raise RuntimeError("Device disconnected right after handshake")
 
                     # Read Real Time Indication with retry for transient GATT failures.
                     last_error = None
