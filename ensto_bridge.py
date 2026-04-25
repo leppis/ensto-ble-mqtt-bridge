@@ -32,7 +32,7 @@ MANUFACTURER_ID = 0x2806
 FACTORY_RESET_ID_UUID = "f366dddb-ebe2-43ee-83c0-472ded74c8fa"
 REAL_TIME_INDICATION_UUID = "66ad3e6b-3135-4ada-bb2b-8b22916b21d4"
 STORAGE_FILE = "ensto_devices.json"
-MAX_DEVICE_ATTEMPTS = 3
+MAX_DEVICE_ATTEMPTS = 4
 DEVICE_RETRY_DELAY = 2
 SERVICE_SETTLE_DELAY = 1.0
 POST_HANDSHAKE_DELAY = 0.1
@@ -52,6 +52,12 @@ def is_connection_lost_error(error):
         or "device disconnected" in message
         or "not connected" in message
     )
+
+
+def retry_delay_seconds(attempt):
+    # Increasing delay helps BlueZ and the thermostat recover from repeated
+    # short-lived connection attempts.
+    return DEVICE_RETRY_DELAY * attempt
 
 
 class EnstoBridge:
@@ -190,7 +196,9 @@ class EnstoBridge:
                             logger.warning(f"Failed to read Factory ID: {e}")
 
                     if factory_id_bytes:
-                        await client.write_gatt_char(FACTORY_RESET_ID_UUID, factory_id_bytes)
+                        await client.write_gatt_char(
+                            FACTORY_RESET_ID_UUID, factory_id_bytes, response=True
+                        )
                         logger.info("Handshake completed successfully!")
                     else:
                         logger.error("Handshake failed: Could not obtain Factory ID. Please put device in PAIRING MODE.")
@@ -234,9 +242,9 @@ class EnstoBridge:
                     return
                 logger.warning(
                     f"Attempt {attempt}/{MAX_DEVICE_ATTEMPTS} failed for {identifier}: {e}. "
-                    f"Retrying in {DEVICE_RETRY_DELAY}s..."
+                    f"Retrying in {retry_delay_seconds(attempt)}s..."
                 )
-                await asyncio.sleep(DEVICE_RETRY_DELAY)
+                await asyncio.sleep(retry_delay_seconds(attempt))
 
     def parse_real_time_data(self, data):
         if len(data) < 10:
