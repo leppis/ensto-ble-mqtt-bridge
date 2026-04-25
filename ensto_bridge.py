@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import json
-import struct
+import random
 from bleak import BleakClient, BleakScanner
 import paho.mqtt.client as mqtt
 
@@ -33,11 +33,59 @@ MANUFACTURER_ID = 0x2806
 FACTORY_RESET_ID_UUID = "f366dddb-ebe2-43ee-83c0-472ded74c8fa"
 REAL_TIME_INDICATION_UUID = "66ad3e6b-3135-4ada-bb2b-8b22916b21d4"
 STORAGE_FILE = "ensto_devices.json"
+MAX_DEVICE_ATTEMPTS = 4
+DEVICE_RETRY_DELAY = 2
+SERVICE_SETTLE_DELAY = 1.0
+POST_HANDSHAKE_DELAY = 0.1
+READ_RETRY_COUNT = 2
+READ_RETRY_DELAY = 0.75
+NOTIFICATION_WAIT_TIMEOUT = 3.0
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 logging.getLogger("bleak").setLevel(logging.DEBUG)
+
+
+def is_connection_lost_error(error):
+    message = str(error).lower()
+    return (
+        "service discovery has not been performed yet" in message
+        or "device disconnected" in message
+        or "not connected" in message
+    )
+
+
+def is_notify_not_supported_error(error):
+    message = str(error).lower()
+    return (
+        "not supported" in message
+        or "org.bluez.error.notsupported" in message
+    )
+
+
+def retry_delay_seconds(attempt):
+    # Increasing delay helps BlueZ and the thermostat recover from repeated
+    # short-lived connection attempts.
+    base_delay = DEVICE_RETRY_DELAY * attempt
+    # Add small jitter to avoid reconnecting at the exact same cadence.
+    return base_delay + random.uniform(0.0, 0.6)
+
+
+def is_transient_connect_error(error_text):
+    lowered = error_text.lower()
+    return (
+        "failed to discover services" in lowered
+        or "timeout" in lowered
+        or "not found" in lowered
+    )
+
+
+def format_exception(error):
+    message = str(error).strip()
+    if message:
+        return message
+    return f"{type(error).__name__}"
 
 
 class EnstoBridge:
@@ -52,6 +100,7 @@ class EnstoBridge:
         
         self.mqtt_client.on_connect = self.on_mqtt_connect
         self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
+        self.notifications_supported = True
 
     def on_mqtt_connect(self, client, userdata, flags, rc, properties=None):
         if rc == 0:
@@ -113,85 +162,172 @@ class EnstoBridge:
         return device
 
     async def process_device(self, identifier):
-        device = await self.find_device(identifier)
-        if not device:
-            logger.error(f"Device '{identifier}' not found during scan")
-            return
-
-        logger.info(f"Connecting to {device.name}...")
-        
-        # Use address string instead of device object to avoid potential stale object issues
-        async with BleakClient(device.address, timeout=20.0) as client:
-            if not client.is_connected:
-                logger.error(f"Failed to connect to {device.address}")
+        device = None
+        if ":" in identifier:
+            device_address = identifier
+            device_name = f"ECO16BT {identifier.replace(':', '').lower()[-6:]}"
+        else:
+            device = await self.find_device(identifier)
+            if not device:
+                logger.error(f"Device '{identifier}' not found during scan")
                 return
-            
-            logger.info(f"Connected successfully")
-            
-            # Longer initial wait for macOS Core Bluetooth to settle
-            logger.info("Waiting for services to initialize...")
-            await asyncio.sleep(5)
-            
-            # Warmup reads removed as they cause instability on Linux
-            # The connection seems to be ready after the initial wait
+            device_address = device.address
+            device_name = device.name or identifier
 
-            
-            # Handshake - required on Linux/Raspberry Pi
-            logger.info("Attempting handshake...")
-            
-            # Check if we have a stored Factory ID
-            stored_data = self.load_device_data()
-            device_id_hex = stored_data.get(device.address)
-            
-            factory_id_bytes = None
-            
-            if device_id_hex:
-                logger.info(f"Found stored Factory ID for {device.address}")
-                try:
-                    factory_id_bytes = bytes.fromhex(device_id_hex)
-                except ValueError:
-                    logger.error("Invalid stored ID format")
-            
-            if not factory_id_bytes:
-                logger.info("No stored ID found. Attempting to read from device (Requires Pairing Mode)...")
-                try:
-                    factory_id_bytes = await client.read_gatt_char(FACTORY_RESET_ID_UUID)
-                    # Check if valid (not all zeros)
-                    if all(b == 0 for b in factory_id_bytes):
-                        logger.warning("Read ID is all zeros! Device NOT in pairing mode?")
-                        factory_id_bytes = None
-                    else:
-                        logger.info(f"Read new Factory ID: {factory_id_bytes.hex()}")
-                        # Store it
-                        stored_data[device.address] = factory_id_bytes.hex()
-                        self.save_device_data(stored_data)
-                        logger.info("Saved Factory ID to storage")
-                except Exception as e:
-                    logger.warning(f"Failed to read Factory ID: {e}")
-
-            if factory_id_bytes:
-                # Write it back to authenticate
-                try:
-                    await client.write_gatt_char(FACTORY_RESET_ID_UUID, factory_id_bytes)
-                    logger.info("Handshake completed successfully!")
-                except Exception as e:
-                    logger.error(f"Handshake write failed: {e}")
-                    return
-            else:
-                 logger.error("Handshake failed: Could not obtain Factory ID. Please put device in PAIRING MODE.")
-                 return
-
-            # Read Real Time Indication
+        for attempt in range(1, MAX_DEVICE_ATTEMPTS + 1):
             try:
-                data = await client.read_gatt_char(REAL_TIME_INDICATION_UUID)
-                parsed_data = self.parse_real_time_data(data)
-                logger.info(f"✅ Data read success: {parsed_data}")
-                
-                self.publish_data(device.address, parsed_data)
-                self.publish_discovery(device.address, device.name)
-                
+                logger.info(f"Connecting to {device_name}... (attempt {attempt}/{MAX_DEVICE_ATTEMPTS})")
+
+                # Prefer the discovered BLEDevice object when available; fall back to address.
+                connect_target = device if device else device_address
+                async with BleakClient(connect_target, timeout=20.0) as client:
+                    if not client.is_connected:
+                        raise RuntimeError(f"Failed to connect to {device_address}")
+
+                    logger.info("Connected successfully")
+
+                    # Keep the settle pause short; long idle waits can cause
+                    # some thermostats to drop the link before handshake.
+                    logger.info("Waiting briefly for services to initialize...")
+                    await asyncio.sleep(SERVICE_SETTLE_DELAY)
+                    if not client.is_connected:
+                        raise RuntimeError("Device disconnected before handshake")
+
+                    # Handshake - required on Linux/Raspberry Pi
+                    logger.info("Attempting handshake...")
+
+                    # Check if we have a stored Factory ID
+                    stored_data = self.load_device_data()
+                    device_id_hex = stored_data.get(device_address)
+
+                    factory_id_bytes = None
+
+                    if device_id_hex:
+                        logger.info(f"Found stored Factory ID for {device_address}")
+                        try:
+                            factory_id_bytes = bytes.fromhex(device_id_hex)
+                        except ValueError:
+                            logger.error("Invalid stored ID format")
+
+                    if not factory_id_bytes:
+                        logger.info("No stored ID found. Attempting to read from device (Requires Pairing Mode)...")
+                        try:
+                            factory_id_bytes = await client.read_gatt_char(FACTORY_RESET_ID_UUID)
+                            # Check if valid (not all zeros)
+                            if all(b == 0 for b in factory_id_bytes):
+                                logger.warning("Read ID is all zeros! Device NOT in pairing mode?")
+                                factory_id_bytes = None
+                            else:
+                                logger.info(f"Read new Factory ID: {factory_id_bytes.hex()}")
+                                # Store it
+                                stored_data[device_address] = factory_id_bytes.hex()
+                                self.save_device_data(stored_data)
+                                logger.info("Saved Factory ID to storage")
+                        except Exception as e:
+                            logger.warning(f"Failed to read Factory ID: {e}")
+
+                    if factory_id_bytes:
+                        await client.write_gatt_char(
+                            FACTORY_RESET_ID_UUID, factory_id_bytes, response=True
+                        )
+                        logger.info("Handshake completed successfully!")
+                    else:
+                        logger.error("Handshake failed: Could not obtain Factory ID. Please put device in PAIRING MODE.")
+                        return
+
+                    await asyncio.sleep(POST_HANDSHAKE_DELAY)
+                    if not client.is_connected:
+                        raise RuntimeError("Device disconnected right after handshake")
+
+                    # Read Real Time Indication with retry for transient GATT failures.
+                    last_error = None
+                    for read_attempt in range(1, READ_RETRY_COUNT + 1):
+                        try:
+                            # Prefer notify-based read first: this avoids immediate
+                            # read-after-write timing issues seen with some devices.
+                            data = await self.read_real_time_via_notify(client)
+                            parsed_data = self.parse_real_time_data(data)
+                            logger.info(f"✅ Data read success: {parsed_data}")
+                            self.publish_data(device_address, parsed_data)
+                            self.publish_discovery(device_address, device_name)
+                            return
+                        except Exception as e:
+                            last_error = e
+                            logger.warning(
+                                f"Read failed (attempt {read_attempt}/{READ_RETRY_COUNT}): {e}"
+                            )
+
+                            # If the connection is already gone, retrying read on this same
+                            # client always fails. Escalate to outer reconnect retry instead.
+                            if not client.is_connected or is_connection_lost_error(e):
+                                raise RuntimeError(
+                                    f"Connection dropped during read phase: {e}"
+                                ) from e
+
+                            if read_attempt < READ_RETRY_COUNT:
+                                await asyncio.sleep(READ_RETRY_DELAY)
+
+                    raise RuntimeError(f"Failed to read data after retries: {last_error}")
+
             except Exception as e:
-                logger.error(f"Failed to read data: {e}")
+                error_text = format_exception(e)
+                if attempt >= MAX_DEVICE_ATTEMPTS:
+                    logger.error(f"Error processing device {identifier}: {error_text}")
+                    return
+
+                # For MAC targets, refresh the BLEDevice object after transient
+                # connect/discovery failures to keep BlueZ path data fresh.
+                if ":" in identifier and is_transient_connect_error(error_text):
+                    refreshed = await self.find_device(identifier)
+                    if refreshed:
+                        device = refreshed
+                        device_address = refreshed.address
+                        device_name = refreshed.name or device_name
+
+                delay_seconds = retry_delay_seconds(attempt)
+                logger.warning(
+                    f"Attempt {attempt}/{MAX_DEVICE_ATTEMPTS} failed for {identifier}: {error_text}. "
+                    f"Retrying in {delay_seconds:.1f}s..."
+                )
+                await asyncio.sleep(delay_seconds)
+
+    async def read_real_time_via_notify(self, client):
+        if not self.notifications_supported:
+            return await client.read_gatt_char(REAL_TIME_INDICATION_UUID)
+
+        loop = asyncio.get_running_loop()
+        payload_future = loop.create_future()
+        notify_started = False
+
+        def notification_handler(_, data):
+            if not payload_future.done():
+                payload_future.set_result(bytes(data))
+
+        try:
+            await client.start_notify(REAL_TIME_INDICATION_UUID, notification_handler)
+            notify_started = True
+            return await asyncio.wait_for(payload_future, timeout=NOTIFICATION_WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"No notification received in {NOTIFICATION_WAIT_TIMEOUT}s, "
+                "falling back to direct GATT read"
+            )
+            return await client.read_gatt_char(REAL_TIME_INDICATION_UUID)
+        except Exception as e:
+            if is_notify_not_supported_error(e):
+                self.notifications_supported = False
+                logger.warning(
+                    "Notifications are not supported for realtime characteristic; "
+                    "switching to direct read mode"
+                )
+                return await client.read_gatt_char(REAL_TIME_INDICATION_UUID)
+            raise
+        finally:
+            if notify_started:
+                try:
+                    await client.stop_notify(REAL_TIME_INDICATION_UUID)
+                except Exception as e:
+                    logger.debug(f"stop_notify cleanup failed: {e}")
 
     def parse_real_time_data(self, data):
         if len(data) < 10:
