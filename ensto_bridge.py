@@ -249,7 +249,6 @@ class EnstoBridge:
                             parsed_data = self.parse_real_time_data(data)
                             logger.info(f"✅ Data read success: {parsed_data}")
                             self.publish_data(device_address, parsed_data)
-                            self.publish_discovery(device_address, device_name)
                             return
                         except Exception as e:
                             last_error = e
@@ -335,16 +334,10 @@ class EnstoBridge:
         
         # Log raw data for debugging
         logger.info(f"Raw data: {data.hex()}")
-        
-        # Parsing logic based on log analysis
-        # Parsing logic based on user calibration
-        # Value is 32-bit uint (bytes 0-3)
-        # Min (5°C): 13038
-        # Max (35°C): 128198
-        # Range: 115160
+
+        # Target temperature is encoded as a 32-bit unsigned integer (bytes 0-3).
+        # Calibration values are based on captured thermostat payloads.
         raw_target = int.from_bytes(data[0:4], byteorder='little')
-        
-        # Linear interpolation: 5 + (raw - 13038) * (30 / 115160)
         target_temp = 5.0 + (raw_target - 13038) * (30.0 / 115160.0)
         target_temp = round(target_temp, 1)
         
@@ -353,12 +346,12 @@ class EnstoBridge:
         
         # Floor temp: bytes 6-7 (little endian), scaled by 10
         floor_temp = int.from_bytes(data[6:8], byteorder='little', signed=True) / 10.0
-        
+
         # Relay state: byte 13 (index 13)
         relay_active = False
         if len(data) > 13:
             relay_active = bool(data[13])
-        
+
         return {
             "target_temperature": target_temp,
             "room_temperature": room_temp,
@@ -370,68 +363,6 @@ class EnstoBridge:
         sanitized_mac = mac.replace(":", "")
         topic = f"ensto_bridge/{sanitized_mac}/state"
         self.mqtt_client.publish(topic, json.dumps(data))
-
-    def publish_discovery(self, mac, device_name=None):
-        sanitized_mac = mac.replace(":", "")
-        name = device_name if device_name else f"Ensto Thermostat {sanitized_mac}"
-        
-        device_info = {
-            "identifiers": [f"ensto_{sanitized_mac}"],
-            "name": name,
-            "manufacturer": "Ensto",
-            "model": "BLE Thermostat"
-        }
-        
-        # Room Temp
-        config_topic = f"homeassistant/sensor/ensto_{sanitized_mac}/room_temp/config"
-        payload = {
-            "name": "Room Temperature",
-            "unique_id": f"ensto_{sanitized_mac}_room_temp",
-            "state_topic": f"ensto_bridge/{sanitized_mac}/state",
-            "value_template": "{{ value_json.room_temperature }}",
-            "unit_of_measurement": "°C",
-            "device_class": "temperature",
-            "device": device_info
-        }
-        self.mqtt_client.publish(config_topic, json.dumps(payload), retain=True)
-
-        # Floor Temp
-        config_topic = f"homeassistant/sensor/ensto_{sanitized_mac}/floor_temp/config"
-        payload = {
-            "name": "Floor Temperature",
-            "unique_id": f"ensto_{sanitized_mac}_floor_temp",
-            "state_topic": f"ensto_bridge/{sanitized_mac}/state",
-            "value_template": "{{ value_json.floor_temperature }}",
-            "unit_of_measurement": "°C",
-            "device_class": "temperature",
-            "device": device_info
-        }
-        self.mqtt_client.publish(config_topic, json.dumps(payload), retain=True)
-        
-        # Target Temp
-        config_topic = f"homeassistant/sensor/ensto_{sanitized_mac}/target_temp/config"
-        payload = {
-            "name": "Target Temperature",
-            "unique_id": f"ensto_{sanitized_mac}_target_temp",
-            "state_topic": f"ensto_bridge/{sanitized_mac}/state",
-            "value_template": "{{ value_json.target_temperature }}",
-            "unit_of_measurement": "°C",
-            "device_class": "temperature",
-            "device": device_info
-        }
-        self.mqtt_client.publish(config_topic, json.dumps(payload), retain=True)
-
-        # Relay State
-        config_topic = f"homeassistant/binary_sensor/ensto_{sanitized_mac}/relay/config"
-        payload = {
-            "name": "Relay Active",
-            "unique_id": f"ensto_{sanitized_mac}_relay",
-            "state_topic": f"ensto_bridge/{sanitized_mac}/state",
-            "value_template": "{{ 'ON' if value_json.relay_active else 'OFF' }}",
-            "device_class": "power",
-            "device": device_info
-        }
-        self.mqtt_client.publish(config_topic, json.dumps(payload), retain=True)
 
 if __name__ == "__main__":
     bridge = EnstoBridge()
