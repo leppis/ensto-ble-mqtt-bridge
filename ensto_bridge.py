@@ -76,10 +76,7 @@ def is_transient_connect_error(error_text):
     lowered = error_text.lower()
     return (
         "failed to discover services" in lowered
-        or "device disconnected" in lowered
         or "timeout" in lowered
-        or "connection dropped during read phase" in lowered
-        or "not connected" in lowered
         or "not found" in lowered
     )
 
