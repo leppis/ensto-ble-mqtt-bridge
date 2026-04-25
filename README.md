@@ -149,7 +149,8 @@ python3 ble_inspect.py
 
 ## Credits
 
-A fork from [jessepesse's ENSTO-MQTT-HA-bridge](https://github.com/leppis/ensto-ble-mqtt-bridge)
+A fork from [jessepesse's ENSTO-MQTT-HA-bridge](https://github.com/leppis/ensto-ble-mqtt-bridge).
+
 Based on research from the [hass_ensto_ble](https://github.com/ExMacro/hass_ensto_ble) project.
 
 ## License
