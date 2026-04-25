@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import json
+import random
 from bleak import BleakClient, BleakScanner
 import paho.mqtt.client as mqtt
 
@@ -66,7 +67,21 @@ def is_notify_not_supported_error(error):
 def retry_delay_seconds(attempt):
     # Increasing delay helps BlueZ and the thermostat recover from repeated
     # short-lived connection attempts.
-    return DEVICE_RETRY_DELAY * attempt
+    base_delay = DEVICE_RETRY_DELAY * attempt
+    # Add small jitter to avoid reconnecting at the exact same cadence.
+    return base_delay + random.uniform(0.0, 0.6)
+
+
+def is_transient_connect_error(error_text):
+    lowered = error_text.lower()
+    return (
+        "failed to discover services" in lowered
+        or "device disconnected" in lowered
+        or "timeout" in lowered
+        or "connection dropped during read phase" in lowered
+        or "not connected" in lowered
+        or "not found" in lowered
+    )
 
 
 def format_exception(error):
@@ -154,11 +169,6 @@ class EnstoBridge:
         if ":" in identifier:
             device_address = identifier
             device_name = f"ECO16BT {identifier.replace(':', '').lower()[-6:]}"
-            # Prime BlueZ cache and get a device object when possible.
-            device = await self.find_device(identifier)
-            if device:
-                device_address = device.address
-                device_name = device.name or device_name
         else:
             device = await self.find_device(identifier)
             if not device:
@@ -268,18 +278,21 @@ class EnstoBridge:
                     logger.error(f"Error processing device {identifier}: {error_text}")
                     return
 
-                # If BlueZ lost the address entry, refresh the BLEDevice object.
-                if ":" in identifier and "not found" in error_text.lower():
-                    device = await self.find_device(identifier)
-                    if device:
-                        device_address = device.address
-                        device_name = device.name or device_name
+                # For MAC targets, refresh the BLEDevice object after transient
+                # connect/discovery failures to keep BlueZ path data fresh.
+                if ":" in identifier and is_transient_connect_error(error_text):
+                    refreshed = await self.find_device(identifier)
+                    if refreshed:
+                        device = refreshed
+                        device_address = refreshed.address
+                        device_name = refreshed.name or device_name
 
+                delay_seconds = retry_delay_seconds(attempt)
                 logger.warning(
                     f"Attempt {attempt}/{MAX_DEVICE_ATTEMPTS} failed for {identifier}: {error_text}. "
-                    f"Retrying in {retry_delay_seconds(attempt)}s..."
+                    f"Retrying in {delay_seconds:.1f}s..."
                 )
-                await asyncio.sleep(retry_delay_seconds(attempt))
+                await asyncio.sleep(delay_seconds)
 
     async def read_real_time_via_notify(self, client):
         if not self.notifications_supported:
