@@ -4,17 +4,15 @@
 > **Project Status: Alpha / Experimental**
 > This project is currently in early development. Features and configuration methods may change. Use with caution.
 
-Python script to read sensor data from Ensto BLE thermostats (ECO16BT, ELTE6-BT) and publish it to Home Assistant via MQTT.
+Python script to read current temperature data from Ensto BLE thermostats (ECO16BT, ELTE6-BT) and publish it to MQTT.
 
 ## Features
 
 - 🔌 **Connects to Ensto BLE thermostats** (ECO16BT, ELTE6-BT)
-- 📡 **Publishes sensor data to MQTT**
-- 🏠 **Home Assistant MQTT Discovery support** (auto-configures sensors)
+- 📡 **Publishes current temperatures to MQTT**
 - 🔐 **Persistent Authentication**: Stores Factory Reset IDs to allow connection without pairing mode.
 - 🔄 **Automatic reconnection and retry logic**
-- 📊 **Reads**: Room temperature, Floor temperature, Target temperature (calibrated*), Relay state
-  > *Note: Target temperature calibration is experimental and may require further tuning.*
+- 📊 **Reads**: Room temperature, Floor temperature, Target temperature, Relay state
 
 ## Requirements
 
@@ -22,11 +20,9 @@ Python script to read sensor data from Ensto BLE thermostats (ECO16BT, ELTE6-BT)
 - **Linux/Raspberry Pi** with BlueZ (macOS is NOT supported due to Core Bluetooth limitations)
 - Bluetooth adapter
 
-### Software§
+### Software
 - Python 3.8+
-- **Home Assistant** with:
-    - **MQTT Broker** (e.g., Mosquitto) installed and running.
-    - **MQTT User** created in Home Assistant with **Local** and **Admin** rights (required for discovery and state updates).
+- MQTT Broker (e.g., Mosquitto)
 
 ## Installation
 
@@ -81,24 +77,6 @@ Edit `config.json` with your settings:
 
 **Subsequent runs do NOT require pairing mode.** The script will use the stored key from `ensto_devices.json`.
 
-## Home Assistant Add-on Installation
-
-You can install this directly in Home Assistant as a local add-on.
-
-1.  **Copy files**: Copy the `ha-addon` folder to your Home Assistant's `/addons/` directory. Rename it to `ensto-bridge` (so the path is `/addons/ensto-bridge`).
-    - You can use the "Samba Share" add-on or SSH to do this.
-    - **Important:** You must also copy `ensto_bridge.py` and `requirements.txt` into that folder! The Dockerfile expects them to be there.
-2.  **Install**:
-    - Go to **Settings > Add-ons > Add-on Store**.
-    - Click **Check for updates** (top right dots).
-    - You should see "Local Add-ons" section with "Ensto BLE MQTT Bridge".
-    - Click **Install**.
-3.  **Configure**:
-    - Go to the **Configuration** tab of the add-on.
-    - Enter your MQTT details and Device MAC addresses.
-4.  **Start**:
-    - Click **Start**. Check the logs to see it connecting.
-
 ## Running as a Service (Linux/Pi)
 
 To keep the bridge running in the background on a standard Linux install:
@@ -143,13 +121,6 @@ Example payload:
 }
 ```
 
-### Discovery Topics
-Home Assistant will automatically discover:
-- `sensor.ensto_<address>_room_temp` - Room temperature
-- `sensor.ensto_<address>_floor_temp` - Floor temperature
-- `sensor.ensto_<address>_target_temp` - Target temperature
-- `binary_sensor.ensto_<address>_relay` - Relay state (heating on/off)
-
 ## Utility Scripts
 
 The repository includes helper scripts for debugging and setup:
@@ -178,7 +149,7 @@ python3 ble_inspect.py
 
 ## Credits
 
-Based on research from the [hass_ensto_ble](https://github.com/ExMacro/hass_ensto_ble) Home Assistant integration.
+Based on research from the [hass_ensto_ble](https://github.com/ExMacro/hass_ensto_ble) project.
 
 ## License
 
