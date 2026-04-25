@@ -61,6 +61,13 @@ def retry_delay_seconds(attempt):
     return DEVICE_RETRY_DELAY * attempt
 
 
+def format_exception(error):
+    message = str(error).strip()
+    if message:
+        return message
+    return f"{type(error).__name__}"
+
+
 class EnstoBridge:
     def __init__(self):
         # Generate a unique client ID to avoid conflicts
@@ -134,9 +141,15 @@ class EnstoBridge:
         return device
 
     async def process_device(self, identifier):
+        device = None
         if ":" in identifier:
             device_address = identifier
             device_name = f"ECO16BT {identifier.replace(':', '').lower()[-6:]}"
+            # Prime BlueZ cache and get a device object when possible.
+            device = await self.find_device(identifier)
+            if device:
+                device_address = device.address
+                device_name = device.name or device_name
         else:
             device = await self.find_device(identifier)
             if not device:
@@ -149,8 +162,9 @@ class EnstoBridge:
             try:
                 logger.info(f"Connecting to {device_name}... (attempt {attempt}/{MAX_DEVICE_ATTEMPTS})")
 
-                # Use address string instead of device object to avoid potential stale object issues
-                async with BleakClient(device_address, timeout=20.0) as client:
+                # Prefer the discovered BLEDevice object when available; fall back to address.
+                connect_target = device if device else device_address
+                async with BleakClient(connect_target, timeout=20.0) as client:
                     if not client.is_connected:
                         raise RuntimeError(f"Failed to connect to {device_address}")
 
@@ -240,11 +254,20 @@ class EnstoBridge:
                     raise RuntimeError(f"Failed to read data after retries: {last_error}")
 
             except Exception as e:
+                error_text = format_exception(e)
                 if attempt >= MAX_DEVICE_ATTEMPTS:
-                    logger.error(f"Error processing device {identifier}: {e}")
+                    logger.error(f"Error processing device {identifier}: {error_text}")
                     return
+
+                # If BlueZ lost the address entry, refresh the BLEDevice object.
+                if ":" in identifier and "not found" in error_text.lower():
+                    device = await self.find_device(identifier)
+                    if device:
+                        device_address = device.address
+                        device_name = device.name or device_name
+
                 logger.warning(
-                    f"Attempt {attempt}/{MAX_DEVICE_ATTEMPTS} failed for {identifier}: {e}. "
+                    f"Attempt {attempt}/{MAX_DEVICE_ATTEMPTS} failed for {identifier}: {error_text}. "
                     f"Retrying in {retry_delay_seconds(attempt)}s..."
                 )
                 await asyncio.sleep(retry_delay_seconds(attempt))
