@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import json
-import struct
 from bleak import BleakClient, BleakScanner
 import paho.mqtt.client as mqtt
 
@@ -33,6 +32,11 @@ MANUFACTURER_ID = 0x2806
 FACTORY_RESET_ID_UUID = "f366dddb-ebe2-43ee-83c0-472ded74c8fa"
 REAL_TIME_INDICATION_UUID = "66ad3e6b-3135-4ada-bb2b-8b22916b21d4"
 STORAGE_FILE = "ensto_devices.json"
+MAX_DEVICE_ATTEMPTS = 3
+DEVICE_RETRY_DELAY = 2
+POST_HANDSHAKE_DELAY = 0.5
+READ_RETRY_COUNT = 2
+READ_RETRY_DELAY = 0.75
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -113,85 +117,103 @@ class EnstoBridge:
         return device
 
     async def process_device(self, identifier):
-        device = await self.find_device(identifier)
-        if not device:
-            logger.error(f"Device '{identifier}' not found during scan")
-            return
-
-        logger.info(f"Connecting to {device.name}...")
-        
-        # Use address string instead of device object to avoid potential stale object issues
-        async with BleakClient(device.address, timeout=20.0) as client:
-            if not client.is_connected:
-                logger.error(f"Failed to connect to {device.address}")
+        if ":" in identifier:
+            device_address = identifier
+            device_name = f"ECO16BT {identifier.replace(':', '').lower()[-6:]}"
+        else:
+            device = await self.find_device(identifier)
+            if not device:
+                logger.error(f"Device '{identifier}' not found during scan")
                 return
-            
-            logger.info(f"Connected successfully")
-            
-            # Longer initial wait for macOS Core Bluetooth to settle
-            logger.info("Waiting for services to initialize...")
-            await asyncio.sleep(5)
-            
-            # Warmup reads removed as they cause instability on Linux
-            # The connection seems to be ready after the initial wait
+            device_address = device.address
+            device_name = device.name or identifier
 
-            
-            # Handshake - required on Linux/Raspberry Pi
-            logger.info("Attempting handshake...")
-            
-            # Check if we have a stored Factory ID
-            stored_data = self.load_device_data()
-            device_id_hex = stored_data.get(device.address)
-            
-            factory_id_bytes = None
-            
-            if device_id_hex:
-                logger.info(f"Found stored Factory ID for {device.address}")
-                try:
-                    factory_id_bytes = bytes.fromhex(device_id_hex)
-                except ValueError:
-                    logger.error("Invalid stored ID format")
-            
-            if not factory_id_bytes:
-                logger.info("No stored ID found. Attempting to read from device (Requires Pairing Mode)...")
-                try:
-                    factory_id_bytes = await client.read_gatt_char(FACTORY_RESET_ID_UUID)
-                    # Check if valid (not all zeros)
-                    if all(b == 0 for b in factory_id_bytes):
-                        logger.warning("Read ID is all zeros! Device NOT in pairing mode?")
-                        factory_id_bytes = None
-                    else:
-                        logger.info(f"Read new Factory ID: {factory_id_bytes.hex()}")
-                        # Store it
-                        stored_data[device.address] = factory_id_bytes.hex()
-                        self.save_device_data(stored_data)
-                        logger.info("Saved Factory ID to storage")
-                except Exception as e:
-                    logger.warning(f"Failed to read Factory ID: {e}")
-
-            if factory_id_bytes:
-                # Write it back to authenticate
-                try:
-                    await client.write_gatt_char(FACTORY_RESET_ID_UUID, factory_id_bytes)
-                    logger.info("Handshake completed successfully!")
-                except Exception as e:
-                    logger.error(f"Handshake write failed: {e}")
-                    return
-            else:
-                 logger.error("Handshake failed: Could not obtain Factory ID. Please put device in PAIRING MODE.")
-                 return
-
-            # Read Real Time Indication
+        for attempt in range(1, MAX_DEVICE_ATTEMPTS + 1):
             try:
-                data = await client.read_gatt_char(REAL_TIME_INDICATION_UUID)
-                parsed_data = self.parse_real_time_data(data)
-                logger.info(f"✅ Data read success: {parsed_data}")
-                
-                self.publish_data(device.address, parsed_data)
-                self.publish_discovery(device.address, device.name)
-                
+                logger.info(f"Connecting to {device_name}... (attempt {attempt}/{MAX_DEVICE_ATTEMPTS})")
+
+                # Use address string instead of device object to avoid potential stale object issues
+                async with BleakClient(device_address, timeout=20.0) as client:
+                    if not client.is_connected:
+                        raise RuntimeError(f"Failed to connect to {device_address}")
+
+                    logger.info("Connected successfully")
+
+                    # Initial wait for BlueZ/CoreBluetooth to settle.
+                    logger.info("Waiting for services to initialize...")
+                    await asyncio.sleep(5)
+
+                    # Handshake - required on Linux/Raspberry Pi
+                    logger.info("Attempting handshake...")
+
+                    # Check if we have a stored Factory ID
+                    stored_data = self.load_device_data()
+                    device_id_hex = stored_data.get(device_address)
+
+                    factory_id_bytes = None
+
+                    if device_id_hex:
+                        logger.info(f"Found stored Factory ID for {device_address}")
+                        try:
+                            factory_id_bytes = bytes.fromhex(device_id_hex)
+                        except ValueError:
+                            logger.error("Invalid stored ID format")
+
+                    if not factory_id_bytes:
+                        logger.info("No stored ID found. Attempting to read from device (Requires Pairing Mode)...")
+                        try:
+                            factory_id_bytes = await client.read_gatt_char(FACTORY_RESET_ID_UUID)
+                            # Check if valid (not all zeros)
+                            if all(b == 0 for b in factory_id_bytes):
+                                logger.warning("Read ID is all zeros! Device NOT in pairing mode?")
+                                factory_id_bytes = None
+                            else:
+                                logger.info(f"Read new Factory ID: {factory_id_bytes.hex()}")
+                                # Store it
+                                stored_data[device_address] = factory_id_bytes.hex()
+                                self.save_device_data(stored_data)
+                                logger.info("Saved Factory ID to storage")
+                        except Exception as e:
+                            logger.warning(f"Failed to read Factory ID: {e}")
+
+                    if factory_id_bytes:
+                        await client.write_gatt_char(FACTORY_RESET_ID_UUID, factory_id_bytes)
+                        logger.info("Handshake completed successfully!")
+                    else:
+                        logger.error("Handshake failed: Could not obtain Factory ID. Please put device in PAIRING MODE.")
+                        return
+
+                    await asyncio.sleep(POST_HANDSHAKE_DELAY)
+
+                    # Read Real Time Indication with retry for transient GATT failures.
+                    last_error = None
+                    for read_attempt in range(1, READ_RETRY_COUNT + 1):
+                        try:
+                            data = await client.read_gatt_char(REAL_TIME_INDICATION_UUID)
+                            parsed_data = self.parse_real_time_data(data)
+                            logger.info(f"✅ Data read success: {parsed_data}")
+                            self.publish_data(device_address, parsed_data)
+                            self.publish_discovery(device_address, device_name)
+                            return
+                        except Exception as e:
+                            last_error = e
+                            logger.warning(
+                                f"Read failed (attempt {read_attempt}/{READ_RETRY_COUNT}): {e}"
+                            )
+                            if read_attempt < READ_RETRY_COUNT:
+                                await asyncio.sleep(READ_RETRY_DELAY)
+
+                    raise RuntimeError(f"Failed to read data after retries: {last_error}")
+
             except Exception as e:
-                logger.error(f"Failed to read data: {e}")
+                if attempt >= MAX_DEVICE_ATTEMPTS:
+                    logger.error(f"Error processing device {identifier}: {e}")
+                    return
+                logger.warning(
+                    f"Attempt {attempt}/{MAX_DEVICE_ATTEMPTS} failed for {identifier}: {e}. "
+                    f"Retrying in {DEVICE_RETRY_DELAY}s..."
+                )
+                await asyncio.sleep(DEVICE_RETRY_DELAY)
 
     def parse_real_time_data(self, data):
         if len(data) < 10:
